@@ -74,6 +74,10 @@ def parse_args():
                         help='path to the output file',
                         type=str,
                         default='results/')
+    parser.add_argument("--use_heuristics",
+                        "--use-heuristics",
+                        action="store_true",
+                        help="if specified, use heuristics to post process predictions",)
 
     args = parser.parse_args()
     return args
@@ -91,14 +95,47 @@ def load_image(input_file, width, height):
     return img_tensor
 
 
-def save_prediction(input_image, joints, joints_vis, output_dir, output_prefix, vis_thresh=0.5):
+def enforce_heuristics(joints, joints_vis, viewpoint):
+    flip_pairs = [[2,6],[3,5],[7,25],[8,24],[9,23],[10,22],[11,21],[12,20],[13,19],[14,18],[15,17]]
+    for fp in flip_pairs:
+        if viewpoint == 'front':
+            left_joint = fp[0] - 1
+            right_joint = fp[1] - 1
+        elif viewpoint == 'back':
+            left_joint = fp[1] - 1
+            right_joint = fp[0] - 1
+
+        if joints[left_joint, 0] > joints[right_joint, 0]:
+            # flip when the left joint is detected on the right
+            tmp = np.copy(joints[left_joint])
+            joints[left_joint] = joints[right_joint]
+            joints[right_joint] = tmp
+
+            tmp = np.copy(joints_vis[left_joint])
+            joints_vis[left_joint] = joints_vis[right_joint]
+            joints_vis[right_joint] = tmp
+
+    return joints, joints_vis
+
+def save_prediction(input_image, joints, joints_vis, output_dir, output_prefix, use_heuristics=False, vis_thresh=0.5):
     os.makedirs(output_dir, exist_ok=True)
+
+    if use_heuristics:
+        if 'front' in output_prefix or 'Front' in output_prefix:
+            joints, joints_vis = enforce_heuristics(joints, joints_vis, 'front')
+        elif 'back' in output_prefix or 'Back' in output_prefix:
+            joints, joints_vis = enforce_heuristics(joints, joints_vis, 'back')
+        else:
+            print("To use heuristics, 'front/Front' or 'back/Back' needs to be in file name")
+            raise
+
     # save the numerical predictions
     width = input_image.shape[2]
     height = input_image.shape[1]
     out = np.concatenate((joints, joints_vis), axis=1)[:25]
     out[:, 0] = out[:, 0] / width
     out[:, 1] = out[:, 1] / height
+
     np.save(f'{output_dir}/{output_prefix}_landmarks.npy', out)
 
     # save the visualization
@@ -170,7 +207,7 @@ def main():
     imfiles = []
     for ext in input_extensions:
         imfiles += sorted(glob(f"{args.input_dir}/*.{ext}"))
-            
+
     for index, input_file in enumerate(imfiles):
         print(f"Processing: {input_file} ({index}/{len(imfiles)})")
         input = load_image(input_file, cfg.MODEL.IMAGE_SIZE[0], cfg.MODEL.IMAGE_SIZE[1])
@@ -186,6 +223,7 @@ def main():
             output_prefix = os.path.basename(input_file).split('.')[0]
             save_prediction(
                 input[0], preds[0]*coeff, maxvals[0], args.output_dir, output_prefix,
+                args.use_heuristics,
             )
 
 if __name__ == '__main__':
