@@ -15,6 +15,7 @@ import numpy as np
 import os
 import pprint
 from glob import glob
+from kornia.geometry.transform import get_tps_transform, warp_image_tps
 
 import torch
 import torch.nn.parallel
@@ -35,9 +36,42 @@ from utils.utils import create_logger
 import dataset
 import models
 
+UV_LANDMARKS_PATH = 'tshirt_uv_landmarks.pth'
+UV_SEGMASK_PATHS = dict(
+    tshirt = dict(
+        core_front='tshirt_uv_segs/tshirt_uv_seg_front.png',
+        sleeve_left_front='tshirt_uv_segs/tshirt_uv_seg_front_left.png',
+        sleeve_right_front='tshirt_uv_segs/tshirt_uv_seg_front_right.png',
+        core_back='tshirt_uv_segs/tshirt_uv_seg_back.png',
+        sleeve_left_back='tshirt_uv_segs/tshirt_uv_seg_back_left.png',
+        sleeve_right_back='tshirt_uv_segs/tshirt_uv_seg_back_right.png',
+    )
+)
+TEXTURE_RESOLUTION = (512, 512)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train keypoints network')
+    
+    parser.add_argument('--front_input',
+                        '--front-input',
+                        help='path to the front input file',
+                        type=str,
+                        required=True)
+    parser.add_argument('--back_input',
+                        '--back-input',
+                        help='path to the back input file',
+                        type=str,
+                        required=True)
+    parser.add_argument('--output_dir',
+                        help='path to the output file',
+                        type=str,
+                        default='results/')
+    parser.add_argument("--use_heuristics",
+                        "--use-heuristics",
+                        action="store_true",
+                        help="if specified, use heuristics to post process predictions",)
+
+    # ****** can ignore the rest of the args for hack week ******
     # general
     parser.add_argument('--cfg',
                         help='experiment configure file name',
@@ -66,22 +100,15 @@ def parse_args():
                         type=str,
                         default='')
 
-    parser.add_argument('--input_dir',
-                        help='path to the input file',
-                        type=str,
-                        default='samples/')
-    parser.add_argument('--output_dir',
-                        help='path to the output file',
-                        type=str,
-                        default='results/')
-    parser.add_argument("--use_heuristics",
-                        "--use-heuristics",
-                        action="store_true",
-                        help="if specified, use heuristics to post process predictions",)
 
     args = parser.parse_args()
     return args
 
+
+def insensitive_glob(pattern):
+    def either(c):
+        return '[%s%s]' % (c.lower(), c.upper()) if c.isalpha() else c
+    return glob(''.join(map(either, pattern)))
 
 def load_image(input_file, width, height):
     img = cv2.imread(input_file)  # reads an image in the BGR format
@@ -166,6 +193,93 @@ def save_prediction(input_image, joints, joints_vis, output_dir, output_prefix, 
     output_file = f'{output_dir}/{output_prefix}_output.jpg'
     cv2.imwrite(output_file, image_numpy)
 
+def load_uv_data(texture_resolution):
+    tshirt_uv_landmarks = torch.load(UV_LANDMARKS_PATH)
+    tshirt_uv_segmasks = {
+        region: cv2.resize(cv2.imread(segmask_path), texture_resolution)
+        for region, segmask_path in UV_SEGMASK_PATHS['tshirt'].items()
+    }
+    return dict(
+        landmarks=tshirt_uv_landmarks,
+        segments=tshirt_uv_segmasks,
+    )
+
+
+def warp_to_uv(photos, landmarks, texture_resolution=(512,512)):
+
+    # TODO: This mapping is specific to tshirts; In the future we need a more general solution
+    region_to_side = dict(
+        core_front='front', sleeve_left_front='front', sleeve_right_front='front',
+        core_back='back', sleeve_left_back='back', sleeve_right_back='back',
+    )
+
+    # Allowing too many indices to define TPS transformation can make warp finicky
+    # TODO:  Remove the need for hardcoing these indices via heuristics
+    valid_indices = dict(
+        core_front=[2, 4, 6, 7, 14, 15, 17, 18, 25],
+        sleeve_left_front=[20, 22, 23, 25],
+        sleeve_right_front=[7, 9, 10, 12],
+        # core_back=[1, 2, 6, 7, 14, 15, 17, 18, 25],
+        core_back=[1, 7, 15, 17, 18, 25],
+        sleeve_left_back=[20, 22, 23, 25],
+        sleeve_right_back=[7, 9 , 10, 12],
+    )
+
+    uv_data = load_uv_data(texture_resolution)
+
+    uv_canvas = torch.zeros(TEXTURE_RESOLUTION[1], TEXTURE_RESOLUTION[0], 3).byte()
+    for clothing_region in uv_data['landmarks']:
+        photo_side = region_to_side[clothing_region]
+
+        # Only include valid landmarks that are available in both the predictions from photo and the destination uv-map
+        valid_photo_landmarks = {k:v[:2] for k,v in landmarks[photo_side].items() if k in valid_indices[clothing_region]}
+        valid_uv_landmarks = {k:v for k,v in uv_data['landmarks'][clothing_region].items() if k in valid_indices[clothing_region]}
+
+        # Prepare valid landmarks for warp
+        normalize_points = lambda p: (p - 0.5) * 2
+        anchors_src = normalize_points(torch.stack(list(valid_photo_landmarks.values()), dim=0).unsqueeze(0))
+        anchors_dst = normalize_points(torch.stack(list(valid_uv_landmarks.values()), dim=0).unsqueeze(0))
+
+        # Apply TPS warp from correct photo to the UV texture canvas
+        kernel_weights, affine_weights = get_tps_transform(anchors_dst, anchors_src)
+        warped_image = warp_image_tps(photos[photo_side]/256.0, anchors_src, kernel_weights, affine_weights)
+        warped_image = (warped_image * 256).byte()
+
+        # Mask out 
+        warped_image_array = warped_image[0].permute(1,2,0).numpy()
+        uv_canvas = uv_canvas * (uv_data['segments'][clothing_region] == 0) + warped_image_array * (uv_data['segments'][clothing_region] > 0)
+
+    return uv_canvas
+
+def convert_outputs_to_uv(
+    front_image_file, back_image_file, front_landmarks_file, back_landmarks_file, output_file):
+    input_image_paths = dict(
+        tshirt=dict(
+            front=front_image_file,
+            back=back_image_file,
+        )
+    )
+    input_landmark_paths = dict(
+        tshirt=dict(
+            front=front_landmarks_file,
+            back=back_landmarks_file,
+        )
+    )
+    
+    tshirt_photos = {
+        side: torch.from_numpy(cv2.resize(cv2.imread(image_path), TEXTURE_RESOLUTION).transpose(2,0,1)[[2,1,0]]).unsqueeze(0)
+        for side, image_path in input_image_paths['tshirt'].items()
+    }
+    
+    tshirt_photos_landmarks = {}
+    for side, landmarks_path in input_landmark_paths['tshirt'].items():
+        landmarks = torch.from_numpy(np.load(landmarks_path))
+        tshirt_photos_landmarks[side] = {}
+        for index, landmark in enumerate(landmarks):
+            tshirt_photos_landmarks[side][index+1] = landmark
+    uv_texture = warp_to_uv(tshirt_photos, tshirt_photos_landmarks, TEXTURE_RESOLUTION)
+    cv2.imwrite(output_file, uv_texture[:,:,[2,1,0]].numpy())
+
 def main():
     args = parse_args()
     update_config(cfg, args)
@@ -203,11 +317,7 @@ def main():
     # model = torch.nn.DataParallel(model, device_ids=cfg.GPUS).cuda()
     model = torch.nn.DataParallel(model).cuda()
     
-    input_extensions = ['jpg', 'png']
-    imfiles = []
-    for ext in input_extensions:
-        imfiles += sorted(glob(f"{args.input_dir}/*.{ext}"))
-
+    imfiles = [args.front_input, args.back_input]
     for index, input_file in enumerate(imfiles):
         print(f"Processing: {input_file} ({index}/{len(imfiles)})")
         input = load_image(input_file, cfg.MODEL.IMAGE_SIZE[0], cfg.MODEL.IMAGE_SIZE[1])
@@ -225,6 +335,17 @@ def main():
                 input[0], preds[0]*coeff, maxvals[0], args.output_dir, output_prefix,
                 args.use_heuristics,
             )
+
+    front_landmarks_file = f"{args.output_dir}/{os.path.basename(args.front_input).split('.')[0]}_landmarks.npy"
+    back_landmarks_file = f"{args.output_dir}/{os.path.basename(args.back_input).split('.')[0]}_landmarks.npy"
+    uv_output_file = f"{args.output_dir}/uv_output.png"
+    convert_outputs_to_uv(
+        args.front_input,
+        args.back_input,
+        front_landmarks_file,
+        back_landmarks_file,
+        uv_output_file,
+    )
 
 if __name__ == '__main__':
     main()
