@@ -13,6 +13,9 @@ from collections import OrderedDict
 import logging
 import os
 
+import sys
+sys.path.append('/home/ubuntu/DeepFashion2/deepfashion2_api/PythonAPI')
+
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 import json_tricks as json

@@ -46,7 +46,7 @@ def get_max_preds(batch_heatmaps):
     return preds, maxvals
 
 
-def get_final_preds(config, output, center, scale, coord_heatmaps=None):
+def get_final_preds(config, output, center=None, scale=None, coord_heatmaps=None):
     heatmap_height = config.MODEL.HEATMAP_SIZE[1]
     heatmap_width = config.MODEL.HEATMAP_SIZE[0]
 
@@ -83,11 +83,11 @@ def get_final_preds(config, output, center, scale, coord_heatmaps=None):
             
     preds = coords.copy()
 
-    # Transform back
-    for i in range(coords.shape[0]):
-        preds[i] = transform_preds(
-            coords[i], center[i], scale[i], [heatmap_width, heatmap_height]
-        )
+    # # Transform back
+    # for i in range(coords.shape[0]):
+    #     preds[i] = transform_preds(
+    #         coords[i], center[i], scale[i], [heatmap_width, heatmap_height]
+    #     )
     return preds, maxvals
 
 def get_original_gts(config, output, center, scale):
