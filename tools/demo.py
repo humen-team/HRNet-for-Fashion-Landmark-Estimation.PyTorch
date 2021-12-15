@@ -219,13 +219,12 @@ def warp_to_uv(photos, landmarks, texture_resolution=(512,512)):
     # Allowing too many indices to define TPS transformation can make warp finicky
     # TODO:  Remove the need for hardcoing these indices via heuristics
     valid_indices = dict(
-        core_front=[2, 4, 6, 7, 14, 15, 17, 18, 25],
-        sleeve_left_front=[20, 22, 23, 25],
-        sleeve_right_front=[7, 9, 10, 12],
-        # core_back=[1, 2, 6, 7, 14, 15, 17, 18, 25],
-        core_back=[1, 7, 15, 17, 18, 25],
-        sleeve_left_back=[20, 22, 23, 25],
-        sleeve_right_back=[7, 9 , 10, 12],
+        core_front=[2, 3, 4, 5, 6, 7, 12, 14, 15, 16, 17, 18, 20, 25],
+        sleeve_left_front=[20, 21, 22, 23, 24, 25],
+        sleeve_right_front=[7, 8, 9, 10, 11, 12],
+        core_back=[1, 2, 6, 7, 12, 14, 15, 17, 18, 20, 25],
+        sleeve_left_back=[20, 21, 22, 23, 24, 25],
+        sleeve_right_back=[7, 8, 9, 10, 11, 12],
     )
 
     uv_data = load_uv_data(texture_resolution)
