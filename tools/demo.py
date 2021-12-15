@@ -16,6 +16,7 @@ import os
 import pprint
 from glob import glob
 from kornia.geometry.transform import get_tps_transform, warp_image_tps
+from sklearn.cluster import KMeans
 
 import torch
 import torch.nn.parallel
@@ -204,8 +205,53 @@ def load_uv_data(texture_resolution):
         segments=tshirt_uv_segmasks,
     )
 
+# This function has hardcoded landmark indices and is designed specifically for DF2 tshirt predictions
+def infer_tshirt_back_color(photos, landmarks, texture_resolution):
 
-def warp_to_uv(photos, landmarks, texture_resolution=(512,512)):
+    uvresx, uvresy = texture_resolution
+
+    # Consider a minimal box enclosed within shoulder and hip joints
+    trunk = landmarks['front']
+    left = max(trunk[7][0], trunk[15][0])
+    right = min(trunk[17][0], trunk[25][0])
+    top = max(trunk[7][1], trunk[25][1])
+    bottom = min(trunk[15][1], trunk[17][1])
+
+    # Infer a crop box around body trunk
+    trunk = landmarks['front']
+    left = max(trunk[7][0], trunk[15][0]).item() * uvresx
+    right = min(trunk[17][0], trunk[25][0]).item() * uvresx
+    top = max(trunk[7][1], trunk[25][1]).item() * uvresy
+    bottom = min(trunk[15][1], trunk[17][1]).item() * uvresy
+
+    # Make crop tighter
+    left, right = int(0.9 * left + 0.1 * right), int(0.1 * left + 0.9 * right)
+    top, bottom = int(0.9 * top + 0.1 * bottom), int(0.1 * top + 0.9 * bottom)
+    crop = photos['front'][0].permute(1,2,0).numpy()[top:bottom, left:right]
+
+    # Find color clusters
+    color_centroids = []
+    flattened_crop = crop.reshape([-1,3])
+    for _ in range(5):
+        kmeans = KMeans(n_clusters=10)
+        kmeans.fit(flattened_crop)
+
+        cluster_sizes = np.unique(kmeans.labels_, return_counts=True)[1]
+        largest_cluster_idx = cluster_sizes.argmax()
+        color_centroids.append(kmeans.cluster_centers_[largest_cluster_idx])
+
+    # Averge over most popular cluster centers
+    color = np.stack(color_centroids, axis=0).mean(axis=0)
+
+    return color
+
+
+def warp_to_uv(photos, landmarks, texture_resolution=(512,512), front_only=False):
+
+    # If no back photo available, use colors from front to fill in back
+    # TODO: Consider colors along edges and wrap around; add graininess to back texture
+    if front_only:
+        back_color = infer_tshirt_back_color(photos, landmarks, texture_resolution)
 
     # TODO: This mapping is specific to tshirts; In the future we need a more general solution
     region_to_side = dict(
@@ -227,9 +273,13 @@ def warp_to_uv(photos, landmarks, texture_resolution=(512,512)):
 
     uv_data = load_uv_data(texture_resolution)
 
-    uv_canvas = torch.zeros(TEXTURE_RESOLUTION[1], TEXTURE_RESOLUTION[0], 3).byte()
+    uv_canvas = torch.zeros(texture_resolution[1], texture_resolution[0], 3).byte()
     for clothing_region in uv_data['landmarks']:
+
         photo_side = region_to_side[clothing_region]
+        if front_only and photo_side == 'back':
+            uv_canvas = uv_canvas * (uv_data['segments'][clothing_region] == 0) + back_color[None, None] * (uv_data['segments'][clothing_region] > 0)
+            continue
 
         # Only include valid landmarks that are available in both the predictions from photo and the destination uv-map
         valid_photo_landmarks = {k:v[:2] for k,v in landmarks[photo_side].items() if k in valid_indices[clothing_region]}
