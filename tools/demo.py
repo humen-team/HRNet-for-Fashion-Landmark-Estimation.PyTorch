@@ -15,7 +15,10 @@ import numpy as np
 import os
 import pprint
 from glob import glob
-from kornia.geometry.transform import get_tps_transform, warp_image_tps
+import sys
+sys.path.append('/home/ubuntu/py-thin-plate-spline')
+import thinplate as tps
+# from kornia.geometry.transform import get_tps_transform, warp_image_tps
 from sklearn.cluster import KMeans
 
 import torch
@@ -262,13 +265,12 @@ def warp_to_uv(photos, landmarks, texture_resolution=(512,512), front_only=False
     # Allowing too many indices to define TPS transformation can make warp finicky
     # TODO:  Remove the need for hardcoing these indices via heuristics
     valid_indices = dict(
-        core_front=[2, 4, 6, 7, 14, 15, 17, 18, 25],
-        sleeve_left_front=[20, 22, 23, 25],
-        sleeve_right_front=[7, 9, 10, 12],
-        # core_back=[1, 2, 6, 7, 14, 15, 17, 18, 25],
-        core_back=[1, 7, 15, 17, 18, 25],
-        sleeve_left_back=[20, 22, 23, 25],
-        sleeve_right_back=[7, 9 , 10, 12],
+        core_front=[2, 3, 4, 5, 6, 7, 12, 14, 15, 16, 17, 18, 20, 25],
+        sleeve_left_front=[20, 21, 22, 23, 24, 25],
+        sleeve_right_front=[7, 8, 9, 10, 11, 12],
+        core_back=[1, 2, 6, 7, 12, 14, 15, 17, 18, 20, 25],
+        sleeve_left_back=[20, 21, 22, 23, 24, 25],
+        sleeve_right_back=[7, 8, 9, 10, 11, 12],
     )
 
     uv_data = load_uv_data(texture_resolution)
@@ -286,20 +288,24 @@ def warp_to_uv(photos, landmarks, texture_resolution=(512,512), front_only=False
         valid_uv_landmarks = {k:v for k,v in uv_data['landmarks'][clothing_region].items() if k in valid_indices[clothing_region]}
 
         # Prepare valid landmarks for warp
-        normalize_points = lambda p: (p - 0.5) * 2
-        anchors_src = normalize_points(torch.stack(list(valid_photo_landmarks.values()), dim=0).unsqueeze(0))
-        anchors_dst = normalize_points(torch.stack(list(valid_uv_landmarks.values()), dim=0).unsqueeze(0))
-
-        # Apply TPS warp from correct photo to the UV texture canvas
-        kernel_weights, affine_weights = get_tps_transform(anchors_dst, anchors_src)
-        warped_image = warp_image_tps(photos[photo_side]/256.0, anchors_src, kernel_weights, affine_weights)
-        warped_image = (warped_image * 256).byte()
+        anchors_src = torch.stack(list(valid_photo_landmarks.values()), dim=0)
+        anchors_dst = torch.stack(list(valid_uv_landmarks.values()), dim=0)
+        
+        photo_numpy = (photos[photo_side]/255.0).squeeze(0).permute(1,2,0).numpy()
+        warped_image = warp_image_tps(photo_numpy, anchors_src.numpy(), anchors_dst.numpy(), dshape=texture_resolution)
+        warped_image = (np.clip(warped_image, 0, 1) * 255).astype(np.uint8)
 
         # Mask out 
-        warped_image_array = warped_image[0].permute(1,2,0).numpy()
-        uv_canvas = uv_canvas * (uv_data['segments'][clothing_region] == 0) + warped_image_array * (uv_data['segments'][clothing_region] > 0)
+        uv_canvas = uv_canvas * (uv_data['segments'][clothing_region] == 0) + warped_image * (uv_data['segments'][clothing_region] > 0)
 
     return uv_canvas
+
+def warp_image_tps(img, c_src, c_dst, dshape=None):
+    dshape = dshape or img.shape
+    theta = tps.tps_theta_from_points(c_src, c_dst, reduced=True)
+    grid = tps.tps_grid(theta, c_dst, dshape)
+    mapx, mapy = tps.tps_grid_to_remap(grid, img.shape)
+    return cv2.remap(img, mapx, mapy, cv2.INTER_CUBIC)
 
 def convert_outputs_to_uv(
     front_image_file, back_image_file, front_landmarks_file, back_landmarks_file, output_file):
